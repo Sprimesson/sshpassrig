@@ -175,6 +175,7 @@ powershell.exe -ExecutionPolicy Bypass -File "$(ProjectDir)\increment_version.ps
   </ItemGroup>
   <ItemGroup>
     <None Include="increment_version.ps1" />
+    <None Include="README.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

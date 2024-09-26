@@ -108,9 +108,11 @@ LPCSTR strstr_maxlen(LPCSTR target, size_t targetLength, const std::string& comp
         return NULL;
     }
 
+    targetLength -= compareLen; // !@! Forgot to
+
     for (size_t i = 0; i <= targetLength; i++, target++)
     {
-        if (strncmp(target, comparePtr, compareLen) == 0)
+        if (_strnicmp(target, comparePtr, compareLen) == 0) // !@! Case insensitive
         {
             return target;
         }
@@ -405,7 +407,7 @@ static bool ParseArg(int argc, const WCHAR* argv[], SRunParams* params)
                 params->timerTimeout = (uint32_t)v;
             }
             else {
-                PRINTERR(L"-n option requires a TARGET_NAME argument.");
+                PRINTERR(L"-T option requires a TIME_S argument.");
                 return false;
             }
         }
@@ -459,18 +461,18 @@ static bool ParseArg(int argc, const WCHAR* argv[], SRunParams* params)
     }
 
     if (params->haveLoop && params->haveTimeout) {
-        PRINTERR(L"Can't have -l and -t together.");
+        PRINTERR(L"Can't have -l and -t/-T together.");
     }
 
     // Ensure that the SUBCMD was provided
     if (params->subCmd.empty())
     {
-        PRINTERR(L"usage: %s [-t|-l|-T TIME] [-e] [-n TARGET_NAME] -- SUBCMD\n"
+        PRINTERR(L"usage: %s [-t|-l|-T TIME_S] [-e] [-n TARGET_NAME] -- SUBCMD\n"
             L"Where:\n"
             L"    -t: Give max 10s for execution of the SUBCMD\n"
             L"    -T: Give max TIME_S seconds for execution of the SUBCMD\n"
             L"    -l: Interactive loop: If the subprocess dies with error, start it again.\n"
-            L"    -e: Suppress any ANSI ESC char from output of SUBCMD\n"
+            L"    -e: Suppress ANSI CSI ESC sequences from output/to input of SUBCMD\n"
             L"    -n: SSH TARGET_NAME, formatted as user@host[:port]\n"
             L"    SUBCMD: Command line to SSH/SCP, following tokens can be expanded:\n"
             L"       $FLAGS$        -o StrictHostKeyChecking=no\n"
@@ -696,7 +698,7 @@ static int CheckLoginResponse(SRunParams* ctx, LPCSTR buffer, DWORD len)
     static std::vector<std::string> pats;
     if (pats.empty())
     {
-        pats = { "denined", "wrong", "permission", ctx->passwordFieldSearch };
+        pats = { "denied", "wrong", "permission", ctx->passwordFieldSearch }; // !@! Typo!
     }
     
     for (const auto& pat : pats)
@@ -1008,7 +1010,7 @@ int wmain(int argc, const WCHAR* argv[])
 {
     SRunParams ctx{};
     HRESULT hr = S_OK;
-    DWORD conMode = 0;
+    DWORD conModeOutOld = MAXDWORD, conModeInOld = MAXDWORD;
 
     if (!ParseArg(argc, argv, &ctx))
     {
@@ -1028,9 +1030,24 @@ int wmain(int argc, const WCHAR* argv[])
     // Modify stdout if is a console
     if (GetFileType(ctx.stdOut) == FILE_TYPE_CHAR && S_OK == hr)
     {
+        DWORD mode;
         ctx.stdOutIsCon = true;
-        GetConsoleMode(ctx.stdOut, &conMode);
-        HR_CHECK_B(SetConsoleMode(ctx.stdOut, conMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING));
+        GetConsoleMode(ctx.stdOut, &mode);
+        DWORD wantedFlags = 0;
+        DWORD unwantedFlags = 0;
+        // Enable output escape sequences towards terminal console. These control the color, caret pos, etc.
+        // If '-e' option is enabled (ctx.haveNoEsc==true), we will be dropping common escape sequences from the output.
+        //   Therefore there is no need for the screen buffer (terminal console) to process them anyway.
+        if (false && !ctx.haveNoEsc)
+        {
+            wantedFlags |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        }
+        else
+        {
+            unwantedFlags |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        }
+        HR_CHECK_B(SetConsoleMode(ctx.stdOut, (mode & ~unwantedFlags) | wantedFlags));
+        conModeOutOld = mode; // to revert later
     }
 
     // Modify stdout if is a console
@@ -1040,35 +1057,51 @@ int wmain(int argc, const WCHAR* argv[])
         
         if (S_OK == hr)
         {
-            GetConsoleMode(ctx.stdIn, &conMode);
+            DWORD mode;
+            GetConsoleMode(ctx.stdIn, &mode);
             DWORD unwantedFlags =
                 (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-            HR_CHECK_B(SetConsoleMode(ctx.stdIn, conMode & ~unwantedFlags));
+            DWORD wantedFlags = 0;
+
+            // Enable/disable input escape sequences that move the caret, coming from the terminal console.
+            if (!ctx.haveNoEsc)
+            {
+                wantedFlags |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+            }
+            else
+            {
+                unwantedFlags |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+            }
+            HR_CHECK_B(SetConsoleMode(ctx.stdIn, (mode & ~unwantedFlags) | wantedFlags));
+            conModeInOld = mode; // to revert later
         }
     }
 
     if (FAILED(hr))
     {
         PRINTERR(L"failed to init console");
-        return hr;
     }
 
     // Look up or readout target credentials from user
-    ctx.readPassFromUser = true;
-
-    if (!ctx.targetName.empty())
+    if (SUCCEEDED(hr))
     {
-        ctx.useCredMgmt = true;
-        ctx.targetNameInCredMgmt = L"sshpassrig/" + ctx.targetName;
+        ctx.readPassFromUser = true;
 
-        if (TRUE == CheckKeyExists(ctx.targetNameInCredMgmt.c_str(), &ctx.pass))
+        if (!ctx.targetName.empty())
         {
-            ctx.readPassFromUser = false;
-            PRINTINFO(L"Password '%s' read from credential manager", ctx.targetNameInCredMgmt.c_str());
+            ctx.useCredMgmt = true;
+            ctx.targetNameInCredMgmt = L"sshpassrig/" + ctx.targetName;
+
+            if (TRUE == CheckKeyExists(ctx.targetNameInCredMgmt.c_str(), &ctx.pass))
+            {
+                ctx.readPassFromUser = false;
+                PRINTINFO(L"Password '%s' read from credential manager", ctx.targetNameInCredMgmt.c_str());
+            }
         }
     }
 
-    if (ctx.readPassFromUser)
+    // Read password from user if needed
+    if (SUCCEEDED(hr) && ctx.readPassFromUser)
     {
         SCedentialPasswordReadoutWindow wndData;
         wndData.readout = &ctx.pass;
@@ -1078,19 +1111,22 @@ int wmain(int argc, const WCHAR* argv[])
         if (FALSE == GetPasswordFromDialog(&wndData))
         {
             PRINTERR(L"No password provided, exiting");
-            return 1;
+            hr = E_FAIL;
         }
     }
 
     // Prepare SUBCMD
-    ReplaceSSHPARAMS(ctx.subCmd, ctx.targetName);
-    PRINTINFO(L"$ %s", ctx.subCmd.c_str());
+    if (SUCCEEDED(hr))
+    {
+        ReplaceSSHPARAMS(ctx.subCmd, ctx.targetName);
+        PRINTINFO(L"$ %s", ctx.subCmd.c_str());
+    }
 
     // Invoke the subprocess
-    bool loopAgain = ctx.haveLoop;
+    bool loopAgain = true;
     int subprocExitCode = 255;
 
-    do
+    while (SUCCEEDED(hr) && loopAgain)
     {
         HANDLE hThInput{}, hThOutput{};
         STARTUPINFOEXW startupInfo{};
@@ -1199,9 +1235,24 @@ int wmain(int argc, const WCHAR* argv[])
         }
         else if (subprocExitCode == 0U)
         {
+            // ssh exited successfully. Don't loop again. The user might have entered "exit" on the remote.
             loopAgain = false;
         }
-    } while (loopAgain);
+        else if (!ctx.haveLoop)
+        {
+            loopAgain = false;
+        }
+    }
+
+    // Revert console settings (no need to check for errors again)
+    if (conModeOutOld != MAXDWORD)
+    {
+        SetConsoleMode(ctx.stdOut, conModeOutOld);
+    }
+    if (conModeInOld != MAXDWORD)
+    {
+        SetConsoleMode(ctx.stdIn, conModeInOld);
+    }
 
     // Return systematic error or error of the child process
     return SUCCEEDED(hr) ? subprocExitCode : hr;
